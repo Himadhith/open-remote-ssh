@@ -585,12 +585,16 @@ else
 fi
 
 if [[ -f $SERVER_LOGFILE ]]; then
-    for i in {1..5}; do
+    MAX_WAIT=20
+    if [[ $PLATFORM == "aix" ]]; then
+        MAX_WAIT=40
+    fi
+    for i in $(seq 1 $MAX_WAIT); do
         LISTENING_ON="$(cat $SERVER_LOGFILE | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
         if [[ -n $LISTENING_ON ]]; then
             break
         fi
-        sleep 0.5
+        sleep 1
     done
 
     if [[ -z $LISTENING_ON ]]; then
