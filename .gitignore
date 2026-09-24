@@ -8,3 +8,5 @@ vscode.d.ts
 vscode.proposed.*.d.ts
 *.ignore.ts
 publish.sh
+releases/
+*.tar.gz
