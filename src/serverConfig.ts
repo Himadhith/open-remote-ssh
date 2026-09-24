@@ -19,7 +19,7 @@ export interface IServerConfig {
     release?: string; // vscodium-like specific
     serverApplicationName: string;
     serverDataFolderName: string;
-    serverDownloadUrlTemplate?: string; // vscodium-like specific
+    serverDownloadUrlTemplate?: string; // set by Bob IDE's product.json; falls back to DEFAULT_DOWNLOAD_URL_TEMPLATE in serverSetup.ts
 }
 
 export async function getVSCodeServerConfig(): Promise<IServerConfig> {

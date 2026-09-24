@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import * as vscode from 'vscode';
 import Log from './common/logger';
 import { getVSCodeServerConfig } from './serverConfig';
 import SSHConnection from './ssh/sshConnection';
@@ -7,8 +8,7 @@ export interface ServerInstallOptions {
     id: string;
     quality: string;
     commit: string;
-    version: string;      // upstream VS Code version (e.g. 1.105.1)
-    buildVersion?: string; // VSCodium build version (e.g. 1.105.17075)
+    version: string;      // full version string from product.json (e.g. "1.126.0+bob2.1.0")
     release?: string;
     extensionIds: string[];
     envVariables: string[];
@@ -16,6 +16,7 @@ export interface ServerInstallOptions {
     serverApplicationName: string;
     serverDataFolderName: string;
     serverDownloadUrlTemplate: string;
+    aixGithubToken?: string;
 }
 
 export interface ServerInstallResult {
@@ -36,12 +37,9 @@ export class ServerInstallError extends Error {
     }
 }
 
-// Modified to point to your AIX server by default
-// const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.ibm.com/tony-varghese/vscodium-aix-server/releases/download/v${version}/vscodium-reh-aix-ppc64-${version}.tar.gz';
-
-// Default AIX server download (tag == version, asset == vscodium-reh-aix-ppc64-${version}.tar.gz)
+// Fallback used only when product.json has no serverDownloadUrlTemplate
 const DEFAULT_DOWNLOAD_URL_TEMPLATE =
-    'https://github.com/tonykuttai/vscodium-aix-server/releases/download/${buildVersion}/vscodium-reh-aix-ppc64-${buildVersion}.tar.gz';
+    'https://update.code.visualstudio.com/commit:${commit}/server-${os}-${arch}/stable';
 
 
 export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTemplate: string | undefined, extensionIds: string[], envVariables: string[], platform: string | undefined, useSocketPath: boolean, logger: Log): Promise<ServerInstallResult> {
@@ -77,42 +75,19 @@ export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTe
     const scriptId = crypto.randomBytes(12).toString('hex');
 
     const vscodeServerConfig = await getVSCodeServerConfig();
-    let buildVersion = extractBuildVersionFromTemplate(
-        vscodeServerConfig.serverDownloadUrlTemplate,
-        vscodeServerConfig.version
-    );
 
-    // If platform is AIX, override with latest GitHub release
-    if (platform === 'aix' || !platform) {
-        logger.trace(`serverDownloadUrlTemplate: ${vscodeServerConfig.serverDownloadUrlTemplate}`);
-        // Extract build version from the client's download URL template
-        const clientBuildVersion = extractBuildVersionFromTemplate(
-            vscodeServerConfig.serverDownloadUrlTemplate,
-            vscodeServerConfig.version
-        );
-        
-        if (clientBuildVersion && clientBuildVersion !== vscodeServerConfig.version) {
-            // We successfully extracted a build version different from the base version
-            buildVersion = clientBuildVersion;
-            logger.trace(`Using client's VSCodium build version for AIX: ${buildVersion}`);
-        } else {
-            // Fallback: try to fetch latest from GitHub
-            const latestAIXVersion = await getLatestAIXServerVersion();
-            if (latestAIXVersion) {
-                logger.trace(`Using latest AIX server version from GitHub: ${latestAIXVersion}`);
-                buildVersion = latestAIXVersion;
-            } else {
-                // Last resort fallback
-                buildVersion = '1.106.27818';
-                logger.trace(`Failed to determine version, using fallback: ${buildVersion}`);
-            }
-        }
-    }
+    const effectiveTemplate =
+        serverDownloadUrlTemplate ||
+        vscodeServerConfig.serverDownloadUrlTemplate ||
+        DEFAULT_DOWNLOAD_URL_TEMPLATE;
+
+    logger.trace(`serverDownloadUrlTemplate: ${effectiveTemplate}`);
+
+    const aixGithubToken = vscode.workspace.getConfiguration('remote.SSH').get<string>('aixServerGithubToken', '');
 
     const installOptions: ServerInstallOptions = {
         id: scriptId,
-        version: vscodeServerConfig.version,          // 1.105.1
-        buildVersion,                                 // 1.105.17075 (parsed)
+        version: vscodeServerConfig.version,   // full string e.g. "1.126.0+bob2.1.0"
         commit: vscodeServerConfig.commit,
         quality: vscodeServerConfig.quality,
         release: vscodeServerConfig.release,
@@ -121,10 +96,8 @@ export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTe
         useSocketPath,
         serverApplicationName: vscodeServerConfig.serverApplicationName,
         serverDataFolderName: vscodeServerConfig.serverDataFolderName,
-        serverDownloadUrlTemplate:
-            serverDownloadUrlTemplate ||
-            vscodeServerConfig.serverDownloadUrlTemplate ||
-            DEFAULT_DOWNLOAD_URL_TEMPLATE,
+        serverDownloadUrlTemplate: effectiveTemplate,
+        aixGithubToken,
     };
 
     let commandOutput: { stdout: string; stderr: string };
@@ -241,12 +214,10 @@ function parseServerInstallOutput(str: string, scriptId: string): { [k: string]:
     return resultMap;
 }
 
-// Simplified AIX installation - uses pre-built server directly
 function generateBashInstallScript({
     id,
     quality,
     version,
-    buildVersion,
     commit,
     release,
     extensionIds,
@@ -254,10 +225,10 @@ function generateBashInstallScript({
     useSocketPath,
     serverApplicationName,
     serverDataFolderName,
-    serverDownloadUrlTemplate
+    serverDownloadUrlTemplate,
+    aixGithubToken,
 }: ServerInstallOptions) {
     const extensions = extensionIds.map(id => '--install-extension ' + id).join(' ');
-    const effectiveBuildVersion = buildVersion ?? version;
 
     return `
 # Server installation script
@@ -265,10 +236,10 @@ function generateBashInstallScript({
 TMP_DIR="\${XDG_RUNTIME_DIR:-"/tmp"}"
 
 DISTRO_VERSION="${version}"
-DISTRO_BUILD_VERSION="${effectiveBuildVersion}"
 DISTRO_COMMIT="${commit}"
 DISTRO_QUALITY="${quality}"
-DISTRO_VSCODIUM_RELEASE="${release ?? ''}"
+DISTRO_RELEASE="${release ?? ''}"
+AIX_GITHUB_TOKEN="${aixGithubToken ?? ''}"
 
 SERVER_APP_NAME="${serverApplicationName}"
 SERVER_INITIAL_EXTENSIONS="${extensions}"
@@ -409,21 +380,52 @@ if [[ $OS_RELEASE_ID = alpine ]]; then
 fi
 
 # Build server download URL
+# For AIX: try to fetch a pre-built patched tarball from the bob-ide-aix-server
+# releases repo first. If no matching release exists yet, fall back to the Linux
+# x64 REH tarball and write a Node.js wrapper at install time.
+AIX_PREBUILT_URL=""
 if [[ $PLATFORM == "aix" ]]; then
-    # For AIX, use the VSCodium build version (e.g. 1.105.17075), not the upstream VS Code version (1.105.1)
-    SERVER_DOWNLOAD_URL="https://github.com/tonykuttai/vscodium-aix-server/releases/download/$DISTRO_BUILD_VERSION/vscodium-reh-aix-ppc64-$DISTRO_BUILD_VERSION.tar.gz"
-
-    echo "Downloading VSCodium server for AIX from GitHub..."
-    echo "URL: $SERVER_DOWNLOAD_URL"
+    AIX_BASE_VERSION=$(echo "$DISTRO_VERSION" | sed 's/+.*//' | tr -dc 0-9.)
+    # Use the GHE API assets endpoint — requires token auth + Accept: application/octet-stream
+    # Browser download URLs on GHE redirect to login page even for public repos
+    if [[ -n "$AIX_BASE_VERSION" ]] && [[ -n "$AIX_GITHUB_TOKEN" ]]; then
+        AIX_RELEASES_API="https://github.ibm.com/api/v3/repos/Himadhith-V/bob-ide-aix-server/releases/tags/v\${AIX_BASE_VERSION}"
+        AIX_ASSET_API_URL=$(curl --silent --connect-timeout 15 \
+            -H "Authorization: token \${AIX_GITHUB_TOKEN}" \
+            "\${AIX_RELEASES_API}" \
+            | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read())
+for a in d.get('assets',[]):
+    n=a.get('name','')
+    if n.startswith('bob-ide-reh-aix-ppc64') and n.endswith('.tar.gz'):
+        print(a['url'])
+        break
+" 2>/dev/null)
+        if [[ -n "\${AIX_ASSET_API_URL}" ]]; then
+            AIX_PREBUILT_URL="\${AIX_ASSET_API_URL}"
+            echo "Found pre-built AIX server asset: \${AIX_PREBUILT_URL}"
+        else
+            echo "No pre-built AIX server found for \${AIX_BASE_VERSION}, using Linux x64 fallback"
+        fi
+    else
+        echo "No AIX GitHub token set or version parse failed, using Linux x64 fallback"
+    fi
+    SERVER_DOWNLOAD_URL="$(echo "${serverDownloadUrlTemplate.replace(/\$\{/g, '\\${')}" \
+        | sed "s/\\\${quality}/$DISTRO_QUALITY/g" \
+        | sed "s/\\\${version}/$DISTRO_VERSION/g" \
+        | sed "s/\\\${commit}/$DISTRO_COMMIT/g" \
+        | sed "s/\\\${os}/linux/g" \
+        | sed "s/\\\${arch}/x64/g" \
+        | sed "s/\\\${release}/$DISTRO_RELEASE/g")"
 else
-    # Original VSCodium/VSCODE URL for other platforms
     SERVER_DOWNLOAD_URL="$(echo "${serverDownloadUrlTemplate.replace(/\$\{/g, '\\${')}" \
         | sed "s/\\\${quality}/$DISTRO_QUALITY/g" \
         | sed "s/\\\${version}/$DISTRO_VERSION/g" \
         | sed "s/\\\${commit}/$DISTRO_COMMIT/g" \
         | sed "s/\\\${os}/$PLATFORM/g" \
         | sed "s/\\\${arch}/$SERVER_ARCH/g" \
-        | sed "s/\\\${release}/$DISTRO_VSCODIUM_RELEASE/g")"
+        | sed "s/\\\${release}/$DISTRO_RELEASE/g")"
 fi
 
 # Check if server script is already installed
@@ -442,84 +444,71 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
         print_install_results_and_exit 1
     }
 
-    # Standard download logic for all platforms including AIX
-    if [[ ! -z $(which wget) ]]; then
-        wget --tries=3 --timeout=10 --continue --no-verbose -O vscode-server.tar.gz $SERVER_DOWNLOAD_URL
-    elif [[ ! -z $(which curl) ]]; then
-        curl --retry 3 --connect-timeout 10 --location --show-error --silent --output vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+    # Download the server tarball
+    DOWNLOAD_URL="$SERVER_DOWNLOAD_URL"
+    STRIP_COMPONENTS=1
+    if [[ $PLATFORM == "aix" ]] && [[ -n "$AIX_PREBUILT_URL" ]]; then
+        # Pre-built AIX tarball: top-level dir is the commit hash, strip it.
+        DOWNLOAD_URL="$AIX_PREBUILT_URL"
+        STRIP_COMPONENTS=1
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if [[ -n "$AIX_GITHUB_TOKEN" ]] && [[ "$DOWNLOAD_URL" == *"github.ibm.com/api"* ]]; then
+            # GHE API asset download: requires token + Accept: application/octet-stream
+            curl --retry 3 --connect-timeout 60 --max-time 300 --location --show-error \
+                -H "Authorization: token $AIX_GITHUB_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                --output vscode-server.tar.gz "$DOWNLOAD_URL"
+        else
+            curl --retry 3 --connect-timeout 60 --max-time 300 --location --show-error \
+                --output vscode-server.tar.gz "$DOWNLOAD_URL"
+        fi
+        DOWNLOAD_EXIT=$?
+    elif command -v wget >/dev/null 2>&1; then
+        wget --tries=3 --timeout=60 --no-verbose -O vscode-server.tar.gz "$DOWNLOAD_URL"
+        DOWNLOAD_EXIT=$?
     else
-        echo "Error no tool to download server binary"
+        echo "Error: curl or wget is required to download the server"
         print_install_results_and_exit 1
     fi
 
-    if (( $? > 0 )); then
-        echo "Error downloading server from $SERVER_DOWNLOAD_URL"
+    if (( DOWNLOAD_EXIT > 0 )); then
+        echo "Error downloading server from $DOWNLOAD_URL (exit $DOWNLOAD_EXIT)"
         print_install_results_and_exit 1
+    fi
+
+    # Verify the downloaded file is a valid gzip
+    if [[ $PLATFORM == "aix" ]]; then
+        if ! /opt/freeware/bin/gtar -tzf vscode-server.tar.gz >/dev/null 2>&1; then
+            echo "Error: downloaded file is not a valid gzip archive"
+            rm -f vscode-server.tar.gz
+            print_install_results_and_exit 1
+        fi
     fi
 
     echo "Extracting server package..."
-    if ! tar -xzf vscode-server.tar.gz --strip-components 1; then
-        echo "Error while extracting server contents"
-        print_install_results_and_exit 1
-    fi
-
-    if (( $? > 0 )); then
-        echo "Error while extracting server contents"
-        print_install_results_and_exit 1
-    fi
-
-    # Special handling for AIX server wrapper
     if [[ $PLATFORM == "aix" ]]; then
-        # Ensure the AIX server wrapper is executable
-        if [[ -f "$SERVER_DIR/bin/codium-server" ]]; then
-            chmod +x "$SERVER_DIR/bin/codium-server"
-            echo "AIX server wrapper made executable"
+        TAR_CMD="/opt/freeware/bin/gtar"
+    else
+        TAR_CMD="tar"
+    fi
+    if ! $TAR_CMD -xzf vscode-server.tar.gz --strip-components $STRIP_COMPONENTS; then
+        echo "Error while extracting server contents"
+        print_install_results_and_exit 1
+    fi
+    rm -f vscode-server.tar.gz
 
-            # Create symlink if VS Code expects code-server but we have codium-server
-            if [[ "$SERVER_APP_NAME" == "code-server" && ! -f "$SERVER_DIR/bin/code-server" ]]; then
-                ln -sf "$SERVER_DIR/bin/codium-server" "$SERVER_DIR/bin/code-server"
-                echo "Created symlink: code-server -> codium-server"
-            fi
-        fi
-        
-        # Verify Node.js is available for AIX
-        if [[ ! -x "/opt/nodejs/bin/node" ]]; then
-            echo "Warning: Node.js not found at /opt/nodejs/bin/node"
-            echo "AIX server may not start properly"
-        else
-            echo "Node.js found at /opt/nodejs/bin/node"
-            /opt/nodejs/bin/node --version
-        fi
-
-BASHRC="$HOME/.bashrc"
-SNIPPET_MARKER="# === VSCodium remote-cli PATH setup ==="
-
-# Create .bashrc if it doesn't exist
-if [ ! -f "$BASHRC" ]; then
-  touch "$BASHRC"
-fi
-
-# Add snippet only if it's not already present
-if ! grep -Fq "$SNIPPET_MARKER" "$BASHRC"; then
-  cat >> "$BASHRC" <<'EOF'
-
-# === VSCodium remote-cli PATH setup ===
-# Add all matching remote-cli directories to PATH
-if [ -d "$HOME/.vscodium-server/bin" ]; then
-  for dir in "$HOME"/.vscodium-server/bin/*/bin/remote-cli; do
-      if [ -d "$dir" ]; then
-          PATH="$PATH:$dir"
-      fi
-  done
-  export PATH
-fi
-# === End VSCodium remote-cli PATH setup ===
-
-EOF
-  echo "remote-cli PATH snippet added to $BASHRC"
-else
-  echo "Snippet already present in $BASHRC, not adding again."
-fi
+    if [[ $PLATFORM == "aix" ]]; then
+        # Write an AIX Node.js wrapper over the Linux server binary.
+        # For pre-built tarballs this is already a shell script; for the Linux
+        # x64 fallback it replaces the ELF binary so AIX Node.js is used.
+        NODE_BIN="/opt/nodejs/bin/node"
+        [[ -x "$NODE_BIN" ]] && echo "Node.js: $($NODE_BIN --version)"
+        mkdir -p "$SERVER_DIR/bin"
+        printf '#!/bin/bash\nNODE_BIN=/opt/nodejs/bin/node\n[[ ! -x $NODE_BIN ]] && echo "ERROR: node not found" >&2 && exit 1\nD=$(cd $(dirname $0) && pwd)\nfor f in $D/../out/server-main.js $D/../out/vs/server/main.js; do [[ -f $f ]] && exec $NODE_BIN $f "$@"; done\necho "ERROR: server entry not found" >&2 && exit 1\n' > "$SERVER_SCRIPT"
+        chmod +x "$SERVER_SCRIPT"
+        echo "AIX Node.js wrapper written to $SERVER_SCRIPT"
     fi
 
     if [[ ! -f $SERVER_SCRIPT ]]; then
@@ -527,17 +516,44 @@ fi
         print_install_results_and_exit 1
     fi
 
-    rm -f vscode-server.tar.gz
-
     popd > /dev/null
+fi
+
+BASHRC="$HOME/.bashrc"
+SNIPPET_MARKER="# === Bob IDE remote-cli PATH setup ==="
+if [ ! -f "$BASHRC" ]; then
+  touch "$BASHRC"
+fi
+if ! grep -Fq "$SNIPPET_MARKER" "$BASHRC"; then
+  cat >> "$BASHRC" <<'EOF'
+
+# === Bob IDE remote-cli PATH setup ===
+if [ -d "$HOME/.bob-ide-server/bin" ]; then
+  for dir in "$HOME"/.bob-ide-server/bin/*/bin/remote-cli; do
+      [ -d "$dir" ] && PATH="$PATH:$dir"
+  done
+  export PATH
+fi
+# === End Bob IDE remote-cli PATH setup ===
+
+EOF
+  echo "remote-cli PATH snippet added to $BASHRC"
 else
-    echo "Server script already installed in $SERVER_SCRIPT"
+  echo "Snippet already present in $BASHRC, not adding again."
 fi
 
 # Try to find if server is already running
 if [[ -f $SERVER_PIDFILE ]]; then
     SERVER_PID="$(cat $SERVER_PIDFILE)"
-    SERVER_RUNNING_PROCESS="$(ps -o pid,args -p $SERVER_PID | grep $SERVER_SCRIPT)"
+    if [[ $PLATFORM == "aix" ]]; then
+        # AIX ps truncates the args column so grepping the full path is unreliable.
+        # Use kill -0 to check if the PID is still alive instead.
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            SERVER_RUNNING_PROCESS="$SERVER_PID"
+        fi
+    else
+        SERVER_RUNNING_PROCESS="$(ps -o pid,args -p $SERVER_PID | grep $SERVER_SCRIPT)"
+    fi
 else
     SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep $SERVER_SCRIPT | grep -v grep)"
 fi
@@ -790,28 +806,3 @@ if($SERVER_ID) {
 `;
 }
 
-function extractBuildVersionFromTemplate(
-    template: string | undefined,
-    fallback: string
-): string {
-    if (!template) {
-        return fallback;
-    }
-
-    // Example template:
-    // https://github.com/VSCodium/vscodium/releases/download/1.105.17075/vscodium-reh-${os}-${arch}-1.105.17075.tar.gz
-    const m = template.match(/download\/([^/]+)\//);
-    return m?.[1] ?? fallback;
-}
-
-async function getLatestAIXServerVersion(): Promise<string | null> {
-    try {
-        const response = await fetch('https://api.github.com/repos/tonykuttai/vscodium-aix-server/releases/latest');
-        if (!response.ok) return null;
-        
-        const data = await response.json();
-        return data.tag_name; // e.g., "1.106.27818"
-    } catch (error) {
-        return null;
-    }
-}

@@ -2,7 +2,7 @@
 	"name": "aix-remote-ssh",
 	"displayName": "AIX Remote - SSH",
 	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "0.0.61",
+	"version": "0.0.62",
 	"publisher": "tonykuttai",
 	"author": {
     "name": "Tony Varghese",
@@ -110,6 +110,12 @@
 				"remote.SSH.experimental.serverBinaryName": {
 					"type": "string",
 					"description": "**Experimental:** The name of the server binary, use this **only if** you are using a client without a corresponding server release",
+					"scope": "application",
+					"default": ""
+				},
+				"remote.SSH.aixServerGithubToken": {
+					"type": "string",
+					"description": "GitHub personal access token (classic, repo scope) for github.ibm.com used to download the pre-built AIX server tarball.",
 					"scope": "application",
 					"default": ""
 				}
