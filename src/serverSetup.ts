@@ -386,27 +386,30 @@ fi
 AIX_PREBUILT_URL=""
 if [[ $PLATFORM == "aix" ]]; then
     AIX_BASE_VERSION=$(echo "$DISTRO_VERSION" | sed 's/+.*//' | tr -dc 0-9.)
-    # Use the GHE API assets endpoint — requires token auth + Accept: application/octet-stream
-    # Browser download URLs on GHE redirect to login page even for public repos
+    # Use the GHE API releases list to find an asset matching the full version string.
+    # This handles multiple bob sub-versions for the same base version (e.g. bob2.1.0, bob2.2.0).
+    # URL-encode '+' as '%2B' for asset name matching.
+    AIX_VERSION_ENCODED=$(echo "$DISTRO_VERSION" | sed 's/+/%2B/g')
     if [[ -n "$AIX_BASE_VERSION" ]] && [[ -n "$AIX_GITHUB_TOKEN" ]]; then
-        AIX_RELEASES_API="https://github.ibm.com/api/v3/repos/Himadhith-V/bob-ide-aix-server/releases/tags/v\${AIX_BASE_VERSION}"
         AIX_ASSET_API_URL=$(curl --silent --connect-timeout 15 \
             -H "Authorization: token \${AIX_GITHUB_TOKEN}" \
-            "\${AIX_RELEASES_API}" \
+            "https://github.ibm.com/api/v3/repos/Himadhith-V/bob-ide-aix-server/releases" \
             | python3 -c "
 import json,sys
-d=json.loads(sys.stdin.read())
-for a in d.get('assets',[]):
-    n=a.get('name','')
-    if n.startswith('bob-ide-reh-aix-ppc64') and n.endswith('.tar.gz'):
-        print(a['url'])
-        break
-" 2>/dev/null)
+ver=sys.argv[1]
+releases=json.loads(sys.stdin.read())
+for r in releases:
+    for a in r.get('assets',[]):
+        n=a.get('name','')
+        if n.startswith('bob-ide-reh-aix-ppc64') and ver in n and n.endswith('.tar.gz'):
+            print(a['url'])
+            raise SystemExit(0)
+" "$AIX_VERSION_ENCODED" 2>/dev/null)
         if [[ -n "\${AIX_ASSET_API_URL}" ]]; then
             AIX_PREBUILT_URL="\${AIX_ASSET_API_URL}"
             echo "Found pre-built AIX server asset: \${AIX_PREBUILT_URL}"
         else
-            echo "No pre-built AIX server found for \${AIX_BASE_VERSION}, using Linux x64 fallback"
+            echo "No pre-built AIX server found for \${DISTRO_VERSION}, using Linux x64 fallback"
         fi
     else
         echo "No AIX GitHub token set or version parse failed, using Linux x64 fallback"
