@@ -1,21 +1,21 @@
 {
-	"name": "aix-remote-ssh",
+	"name": "bob-aix-remote-ssh",
 	"displayName": "AIX Remote - SSH",
-	"description": "Use any remote machine with a SSH server as your development environment.",
+	"description": "Use any AIX remote machine with a SSH server as your development environment with IBM Bob IDE.",
 	"version": "0.0.62",
-	"publisher": "tonykuttai",
+	"publisher": "Himadhith-V",
 	"author": {
-    "name": "Tony Varghese",
-    "email": "tonypalampalliyil@gmail.com",
-    "url": "https://github.com/tonykuttai"
+    "name": "Himadhith V",
+    "email": "himadhithv@ibm.com",
+    "url": "https://github.ibm.com/Himadhith-V"
   	},
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/tonykuttai/open-remote-ssh.git"
+		"url": "https://github.ibm.com/Himadhith-V/bob-remote-ssh.git"
 	},
 	"bugs": {
-		"url": "https://github.com/tonykuttai/open-remote-ssh/issues"
+		"url": "https://github.ibm.com/Himadhith-V/bob-remote-ssh/issues"
 	},
 	"icon": "resources/icon.png",
 	"engines": {
