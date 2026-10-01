@@ -2,7 +2,7 @@
 	"name": "bob-aix-remote-ssh",
 	"displayName": "AIX Remote - SSH",
 	"description": "Use any AIX remote machine with a SSH server as your development environment with IBM Bob IDE.",
-	"version": "0.0.62",
+	"version": "0.0.63",
 	"publisher": "Himadhith-V",
 	"author": {
     "name": "Himadhith V",
