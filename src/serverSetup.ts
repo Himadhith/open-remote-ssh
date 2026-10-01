@@ -365,6 +365,22 @@ else
     fi
 fi
 
+# Kill any running server processes from other commits (version mismatch prevention)
+if [[ $PLATFORM == "aix" ]]; then
+    for PIDFILE in "$SERVER_DATA_DIR"/.*\.pid; do
+        [[ -f "$PIDFILE" ]] || continue
+        OLD_COMMIT=$(basename "$PIDFILE" | sed 's/^\.//' | sed 's/\.pid$//')
+        if [[ "$OLD_COMMIT" != "$DISTRO_COMMIT" ]]; then
+            OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
+            if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+                echo "Killing old server (commit $OLD_COMMIT, pid $OLD_PID)"
+                kill "$OLD_PID" 2>/dev/null || true
+            fi
+            rm -f "$PIDFILE"
+        fi
+    done
+fi
+
 # Create installation folder
 if [[ ! -d $SERVER_DIR ]]; then
     mkdir -p $SERVER_DIR
@@ -391,7 +407,7 @@ if [[ $PLATFORM == "aix" ]]; then
     # URL-encode '+' as '%2B' for asset name matching.
     AIX_VERSION_ENCODED=$(echo "$DISTRO_VERSION" | sed 's/+/%2B/g')
     if [[ -n "$AIX_BASE_VERSION" ]] && [[ -n "$AIX_GITHUB_TOKEN" ]]; then
-        AIX_ASSET_API_URL=$(curl --silent --connect-timeout 15 \
+        AIX_RELEASE_INFO=$(curl --silent --connect-timeout 15 \
             -H "Authorization: token \${AIX_GITHUB_TOKEN}" \
             "https://github.ibm.com/api/v3/repos/Himadhith-V/bob-ide-aix-server/releases" \
             | python3 -c "
@@ -402,12 +418,15 @@ for r in releases:
     for a in r.get('assets',[]):
         n=a.get('name','')
         if n.startswith('bob-ide-reh-aix-ppc64') and ver in n and n.endswith('.tar.gz'):
-            print(a['url'])
+            print(a['url'] + '|' + r.get('tag_name','unknown') + '|' + n)
             raise SystemExit(0)
 " "$AIX_VERSION_ENCODED" 2>/dev/null)
+        AIX_ASSET_API_URL=$(echo "\${AIX_RELEASE_INFO}" | cut -d'|' -f1)
+        AIX_RELEASE_TAG=$(echo "\${AIX_RELEASE_INFO}" | cut -d'|' -f2)
+        AIX_ASSET_NAME=$(echo "\${AIX_RELEASE_INFO}" | cut -d'|' -f3)
         if [[ -n "\${AIX_ASSET_API_URL}" ]]; then
             AIX_PREBUILT_URL="\${AIX_ASSET_API_URL}"
-            echo "Found pre-built AIX server asset: \${AIX_PREBUILT_URL}"
+            echo "AIX server tarball: \${AIX_ASSET_NAME} (release \${AIX_RELEASE_TAG})"
         else
             echo "No pre-built AIX server found for \${DISTRO_VERSION}, using Linux x64 fallback"
         fi
