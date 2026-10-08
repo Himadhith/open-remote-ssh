@@ -6,9 +6,10 @@ A comprehensive guide to get VSCodium remote server working on IBM AIX PowerPC s
 
 VSCodium server fails on AIX PowerPC due to several compatibility issues:
 - Missing git submodules in native Node.js modules
-- Thread-local storage (TLS) incompatibility 
+- Thread-local storage (TLS) incompatibility
 - Platform detection only supporting `win32`, `darwin`, `linux`
 - Pre-compiled x86-64 native binaries incompatible with PowerPC
+- `computeTargetPlatform` falls through to `"web"` on AIX, blocking `--install-extension` for non-web VSIXes (e.g. clangd)
 
 ##  Solution Steps
 

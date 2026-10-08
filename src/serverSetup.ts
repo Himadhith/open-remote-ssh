@@ -531,6 +531,94 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
         printf '#!/bin/bash\nNODE_BIN=/opt/nodejs/bin/node\n[[ ! -x $NODE_BIN ]] && echo "ERROR: node not found" >&2 && exit 1\nD=$(cd $(dirname $0) && pwd)\nfor f in $D/../out/server-main.js $D/../out/vs/server/main.js; do [[ -f $f ]] && exec $NODE_BIN $f "$@"; done\necho "ERROR: server entry not found" >&2 && exit 1\n' > "$SERVER_SCRIPT"
         chmod +x "$SERVER_SCRIPT"
         echo "AIX Node.js wrapper written to $SERVER_SCRIPT"
+
+        # Two patches to server-main.js so that --install-extension works on AIX:
+        #
+        # Patch 1 — computeTargetPlatform: AIX falls through to case 0 ("web") in
+        # the platform enum.  Prepend an early return of "unknown" so the server
+        # reports an honest target platform instead of "web".
+        # Anchored on the preserved debug string "ComputeTargetPlatform:".
+        #
+        # Patch 2 — web-platform gate (Hc / Wie / JDe depending on Bob version):
+        # Even with computeTargetPlatform fixed, the gate function that checks
+        # t==="web"&&!e.includes("web") can still fire from a cached target-platform
+        # value set at service startup.  The surgical fix is to add an AIX guard so
+        # the gate only applies when the server is genuinely running in a web context,
+        # not when "web" is a false positive from the enum fallthrough.
+        python3 - "$SERVER_DIR" <<'PYEOF'
+import glob, re, sys
+
+root = sys.argv[1]
+
+# --- Patch 1: computeTargetPlatform ---
+MARK1  = '"ComputeTargetPlatform:"'
+GUARD1 = 'if(process.platform==="aix")return"unknown";'
+p1_patched = 0
+p1_already = 0
+
+for f in glob.glob(root + "/out/**/*.js", recursive=True):
+    try:
+        s = open(f, encoding="utf-8").read()
+    except Exception:
+        continue
+    if MARK1 not in s:
+        continue
+    if GUARD1 in s:
+        p1_already += 1
+        print("AIX patch1: already applied in", f)
+        continue
+    out, pos = [], 0
+    for m in re.finditer(re.escape(MARK1), s):
+        head = s.rfind("async function", pos, m.start())
+        if head < 0:
+            sys.exit("AIX patch1 ERROR: no 'async function' before ComputeTargetPlatform: in " + f)
+        brace = s.index("{", head) + 1
+        out.append(s[pos:brace] + GUARD1)
+        pos = brace
+        p1_patched += 1
+    out.append(s[pos:])
+    open(f, "w", encoding="utf-8").write("".join(out))
+    print("AIX patch1: computeTargetPlatform patched in", f)
+
+if p1_patched == 0 and p1_already == 0:
+    sys.exit("AIX patch1 ERROR: ComputeTargetPlatform: marker not found in any bundle under " + root)
+print("AIX patch1: done (" + str(p1_patched) + " patched, " + str(p1_already) + " already applied)")
+
+# --- Patch 2: web-platform gate ---
+# The gate function body is: return t==="web"&&!e.includes("web")
+# Replace with: return t==="web"&&!e.includes("web")&&process.platform!=="aix"
+# This preserves protection for genuine web contexts while disabling the false
+# positive on AIX where "web" is a misidentification from the platform enum.
+GATE_OLD = 'return t==="web"&&!e.includes("web")'
+GATE_NEW = 'return t==="web"&&!e.includes("web")&&process.platform!=="aix"'
+p2_patched = 0
+p2_already = 0
+
+for f in glob.glob(root + "/out/**/*.js", recursive=True):
+    try:
+        s = open(f, encoding="utf-8").read()
+    except Exception:
+        continue
+    if GATE_OLD not in s and GATE_NEW not in s:
+        continue
+    if GATE_NEW in s:
+        p2_already += 1
+        print("AIX patch2: already applied in", f)
+        continue
+    patched = s.replace(GATE_OLD, GATE_NEW)
+    open(f, "w", encoding="utf-8").write(patched)
+    p2_patched += 1
+    print("AIX patch2: web-platform gate patched in", f)
+
+if p2_patched == 0 and p2_already == 0:
+    print("AIX patch2 WARN: web-platform gate pattern not found - may have changed in this Bob version")
+else:
+    print("AIX patch2: done (" + str(p2_patched) + " patched, " + str(p2_already) + " already applied)")
+PYEOF
+        if (( $? != 0 )); then
+            echo "Error: AIX server bundle patch failed"
+            print_install_results_and_exit 1
+        fi
     fi
 
     if [[ ! -f $SERVER_SCRIPT ]]; then
@@ -562,6 +650,33 @@ EOF
   echo "remote-cli PATH snippet added to $BASHRC"
 else
   echo "Snippet already present in $BASHRC, not adding again."
+fi
+
+# On AIX, if the server is running but the computeTargetPlatform patch has not yet
+# been applied to its bundle, kill it so it restarts with the patched code.
+# This handles the case where the commit hash has not changed (server reused) but
+# the patch is being applied for the first time.
+if [[ $PLATFORM == "aix" ]] && [[ -f $SERVER_PIDFILE ]]; then
+    SERVER_PID="$(cat $SERVER_PIDFILE)"
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        GUARD='if(process.platform==="aix")return"unknown";'
+        NEEDS_RESTART=0
+        for bundle in "$SERVER_DIR"/out/**/*.js "$SERVER_DIR"/out/*.js; do
+            [[ -f "$bundle" ]] || continue
+            if grep -qF '"ComputeTargetPlatform:"' "$bundle" 2>/dev/null; then
+                if ! grep -qF "$GUARD" "$bundle" 2>/dev/null; then
+                    NEEDS_RESTART=1
+                fi
+                break
+            fi
+        done
+        if (( NEEDS_RESTART )); then
+            echo "AIX: killing running server (pid $SERVER_PID) to reload patched bundle"
+            kill "$SERVER_PID" 2>/dev/null || true
+            rm -f "$SERVER_PIDFILE"
+            SERVER_RUNNING_PROCESS=""
+        fi
+    fi
 fi
 
 # Try to find if server is already running
